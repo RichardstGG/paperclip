@@ -1345,6 +1345,8 @@ export async function buildSshSpawnTarget(input: {
   command: string;
   args: string[];
   env: Record<string, string>;
+  /** Opt-in control channel isolation; other adapters retain their SSH config. */
+  isolated?: boolean;
 }): Promise<{
   command: string;
   args: string[];
@@ -1357,6 +1359,18 @@ export async function buildSshSpawnTarget(input: {
   }
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [...auth.args];
+  if (input.isolated) {
+    sshArgs.push(
+      "-F", "/dev/null",
+      "-o", "ForwardAgent=no",
+      "-o", "ClearAllForwardings=yes",
+      "-o", "ControlMaster=no",
+      "-o", "ControlPath=none",
+      "-o", "IdentitiesOnly=yes",
+      "-o", "IdentityAgent=none",
+      "-o", "GlobalKnownHostsFile=/dev/null",
+    );
+  }
   const envArgs = Object.entries(input.env)
     .filter((entry): entry is [string, string] => typeof entry[1] === "string")
     .map(([key, value]) => `${key}=${shellQuote(value)}`);

@@ -53,6 +53,7 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
+import { executeBridge } from "./bridge-execute.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -345,7 +346,14 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
+  const enteredAt = Date.now();
   const config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(config, "bridgeProfile")) {
+    return executeBridge({ ...ctx, config }, enteredAt);
+  }
+  if (ctx.executionTarget?.kind === "remote") {
+    throw new Error("Remote Hermes execution requires an explicit bridgeProfile");
+  }
 
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = resolveHermesCommand(config);
