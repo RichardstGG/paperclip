@@ -3503,6 +3503,7 @@ async function resolveSpawnTarget(
   options: {
     remoteExecution?: RemoteExecutionSpec | null;
     remoteEnv?: Record<string, string> | null;
+    isolateSsh?: boolean;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
   } = {},
 ): Promise<SpawnTarget> {
@@ -3514,6 +3515,7 @@ async function resolveSpawnTarget(
     }
     const spawnTarget = await buildSshSpawnTarget({
       spec: remote,
+      isolated: options.isolateSsh,
       command,
       args,
       env: Object.fromEntries(
@@ -4575,6 +4577,9 @@ export async function runChildProcess(
     }) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
+    signal?: AbortSignal;
+    keepStdinOpen?: boolean;
+    isolateSsh?: boolean;
     remoteExecution?: RemoteExecutionSpec | null;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
   },
@@ -4583,6 +4588,10 @@ export async function runChildProcess(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
+    if (opts.signal?.aborted) {
+      reject(new Error("Process cancelled before connection"));
+      return;
+    }
     const rawMerged: NodeJS.ProcessEnv = {
       ...sanitizeInheritedPaperclipEnv(process.env),
       ...opts.env,
@@ -4610,9 +4619,14 @@ export async function runChildProcess(
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
       remoteEnv: opts.remoteExecution ? opts.env : null,
+      isolateSsh: opts.isolateSsh,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
+        if (opts.signal?.aborted) {
+          void target.cleanup?.();
+          throw new Error("Process cancelled before spawn");
+        }
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
@@ -4622,7 +4636,7 @@ export async function runChildProcess(
           env: childEnv,
           detached: process.platform !== "win32",
           shell: false,
-          stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+          stdio: [opts.stdin != null || opts.keepStdinOpen ? "pipe" : "ignore", "pipe", "pipe"],
         }) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
@@ -4658,6 +4672,19 @@ export async function runChildProcess(
         let terminalCleanupKillTimer: NodeJS.Timeout | null = null;
         let terminalResultStdoutScanOffset = 0;
         let terminalResultStderrScanOffset = 0;
+        let abortKillTimer: NodeJS.Timeout | null = null;
+        const onAbort = () => {
+          signalRunningProcess({ child, processGroupId }, "SIGTERM");
+          abortKillTimer ??= setTimeout(() => {
+            signalRunningProcess({ child, processGroupId }, "SIGKILL");
+          }, Math.max(1, opts.graceSec) * 1000);
+        };
+        opts.signal?.addEventListener("abort", onAbort, { once: true });
+        if (opts.signal?.aborted) onAbort();
+        const clearAbort = () => {
+          opts.signal?.removeEventListener("abort", onAbort);
+          if (abortKillTimer) clearTimeout(abortKillTimer);
+        };
 
         const clearTerminalCleanupTimers = () => {
           if (terminalCleanupTimer) clearTimeout(terminalCleanupTimer);
@@ -4780,11 +4807,12 @@ export async function runChildProcess(
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
             stdin.write(opts.stdin as string);
-            stdin.end();
+            if (!opts.keepStdinOpen) stdin.end();
           });
         }
 
         child.on("error", (err: Error) => {
+          clearAbort();
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
@@ -4805,6 +4833,7 @@ export async function runChildProcess(
         child.on(
           "close",
           (code: number | null, signal: NodeJS.Signals | null) => {
+            clearAbort();
             if (timeout) clearTimeout(timeout);
             clearTerminalCleanupTimers();
             runningProcesses.delete(runId);

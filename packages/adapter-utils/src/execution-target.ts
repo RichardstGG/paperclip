@@ -274,6 +274,11 @@ export interface AdapterExecutionTargetProcessOptions {
   cwd: string;
   env: Record<string, string>;
   stdin?: string;
+  /** SSH/local only. Defaults preserve the existing process lifecycle. */
+  signal?: AbortSignal;
+  keepStdinOpen?: boolean;
+  /** Ignore ambient SSH configuration and disable forwarding/multiplexing. */
+  isolateSsh?: boolean;
   timeoutSec: number;
   graceSec: number;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
@@ -915,6 +920,9 @@ export async function runAdapterExecutionTargetProcess(
     cwd: options.cwd,
     env,
     stdin: options.stdin,
+    signal: options.signal,
+    keepStdinOpen: options.keepStdinOpen,
+    isolateSsh: options.isolateSsh,
     timeoutSec: options.timeoutSec,
     graceSec: options.graceSec,
     onLog: options.onLog,

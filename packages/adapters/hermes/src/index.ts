@@ -113,6 +113,15 @@ tools, persistent memory, session persistence, skills, and MCP support.
 | env | object | {} | Extra environment variables |
 | promptTemplate | string | (default) | Custom prompt template with {{variable}} placeholders |
 
+## AetherDesk SSH Bridge Profile
+
+The fork also supports an explicit \`bridgeProfile\` object for SSH execution.
+Set \`hermesCommand\` to the protected bridge CLI, configure a persistent private
+control-state directory and a unique control instance, and provide a strictly
+pinned SSH execution target. This profile sends no control/runtime/provider
+credentials and uses structured result v1 only. See the package README for the
+configuration and bridge CLI contract. Native local behavior is unchanged.
+
 ## Hermes-Originated Paperclip Tasks
 
 This adapter package also ships a Hermes-facing Paperclip task bridge skill:

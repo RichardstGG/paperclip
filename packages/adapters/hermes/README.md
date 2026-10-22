@@ -15,6 +15,142 @@ and Paperclip should start `hermes chat` for each heartbeat. Choose
 another host, in Docker, or behind a private-network/TLS endpoint. The adapter
 type keys did not change during package consolidation.
 
+## AetherDesk SSH bridge profile (fork extension)
+
+The native local profile keeps its existing Hermes CLI, environment, session and
+text-parser behavior. Remote execution requires an explicitly configured
+`bridgeProfile`; a remote target without this profile is rejected. This profile
+uses `ctx.executionTarget` through the shared execution-target process helper,
+requires SSH with strict host checking, explicit private identity and pinned
+`knownHosts`, and ignores legacy target configuration. It never falls back to a
+local process or the native text parser.
+
+Example adapter configuration (deployment-specific paths are illustrative):
+
+```json
+{
+  "hermesCommand": "/opt/aetherdesk/bin/bridge",
+  "timeoutSec": 300,
+  "bridgeProfile": {
+    "controlInstance": "unique-control-instance",
+    "stateDirectory": "/var/lib/paperclip/bridge-control",
+    "workspacePolicySha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "executionSlot": "task-slot",
+    "cleanupTimeoutSec": 10
+  }
+}
+```
+
+`stateDirectory` must already exist on the control host, be owned by the
+Paperclip UID, have no group/other permissions, and contain no symlink in its
+resolved path. Mount it as persistent control data, outside agent workspaces;
+include it and the Paperclip run events in backups. Never delete it to retry a
+run. A missing/unreadable/corrupt intent after known dispatch requires operator
+reconciliation, not ledger recreation. `controlInstance` must identify one
+Paperclip database and remain stable across restart/restore. The host must
+supply a validated task in `ctx.runtime.taskKey`. There is no automatic session
+resume or attempt creation in this profile. The remote working directory and
+bridge executable must be protected management-UID assets.
+
+The adapter exclusively creates and fsyncs an immutable per-attempt
+`intent.json`, then fsyncs its directory before any SSH connection. It also
+awaits the existing durable `onEvent` run-event seam (`bridge.dispatch_intent`)
+when supplied. The control directory is the re-entry source because the current
+adapter context cannot read prior run events. Intent presence consumes dispatch
+permission, even after a crash before the first connection. Concurrent callers
+cannot both dispatch. An incomplete intent is quarantined as unknown. Accepted
+result revisions and stop request IDs are also exclusive, fsynced records.
+
+The descriptor includes the canonical tuple, task/agent identity, protocol v1,
+exact prompt SHA-256 and byte count, absolute deadline, policy digest, slot and
+allowlisted non-secret parameters (`model`, `provider`, `toolsets`,
+`maxTurnsPerRun`). `dispatch_sha256` hashes the canonical descriptor excluding
+itself. Prompt bytes are staged through stdin as a file; neither the prompt nor
+credentials occur in SSH argv. Only prompt and descriptor are transferred;
+there is no workspace, home, instructions-file, skill or runtime-tool sync.
+The default prompt uses task title/body/host-selected task markdown. A custom
+`promptTemplate` can use `agent.{id,name,companyId}`, `run.id`, `taskId`,
+`taskTitle`, `taskBody`, and `taskMarkdown`. Native Paperclip API instructions,
+raw wake payloads and runtime tools are not interpolated. Known control/runtime
+secrets and common credential patterns in the payload are rejected before SSH.
+This check complements the host's responsibility to provide a non-secret brief.
+
+The remote environment allowlist starts empty. `config.env`, inherited env,
+Paperclip bearers and provider keys are never forwarded. Provider credentials
+must be provisioned on the execution side for the task by the deployment. The
+opt-in SSH isolation flag ignores ambient SSH config and disables agent
+forwarding, multiplexing, default identity-agent access and forwarding rules.
+Other adapters retain their existing defaults.
+
+`timeoutSec` must be positive (default 300); the deadline starts at adapter entry
+and covers readiness, staging, run and reporting. Re-entry retains the stored
+deadline. The abort handler is installed before `onCancellationReady`; the
+signal is checked again before transport. Cancellation/deadline/channel failure
+uses a separate `stop` SSH invocation with its own signal and bounded cleanup
+(default 10, maximum 60 seconds, plus at most one second of local SSH kill grace).
+A readiness callback that stalls until the deadline returns unknown without
+connecting. The adapter waits for validated stop evidence, never equating local SSH exit
+with remote quiescence. Run stdin remains open until the channel closes.
+
+Bridge CLI interoperability required by this profile:
+
+- `run --descriptor <file>` uses the immutable descriptor and file prompt.
+- `stop --attempt <key> --reason <reason> --request <id>` returns the one-line
+  committed stop-evidence JSON from the execution contract, or the immutable
+  result v1 if the descriptor is already known. A stop before descriptor
+  delivery cannot know the dispatch hash; evidence-only replies are checked
+  against the attempt/request/reason, scope/generation and quiescence proof.
+  Such replies produce local cancellation/deadline metadata with
+  `evidence_source="bridge.stop"`, never a fabricated result revision or usage.
+  Channel-loss evidence alone still leaves the outcome unknown. A result already
+  settled before the request may be returned unchanged. For never-started
+  evidence, require `never_started=true`, `claim_consumed=false`, `tombstone=true`,
+  null scope and confirmed empty scope.
+- `inspect --attempt <key>` returns a JSON snapshot with `protocol`,
+  `schema_version`, `attempt_key`, `dispatch_sha256`, `deadline`, and the highest
+  positive `result_revision`. Missing results are unknown; inspect never starts.
+- `report --attempt <key> --revision <n>` returns that immutable result v1 line.
+  Re-entry uses inspect/report only; intermediate revisions are fetched and
+  validated in order. Stop may fetch missing intermediate reports within the
+  same cleanup budget. A maximum of 1000 missing revisions is accepted per call.
+
+Result v1 follows `aetherdesk.execution`, schema 1: one UTF-8 JSON line plus LF,
+at most 1 MiB, no duplicate keys, valid tuple/hash chain, required mapping,
+completion, scope evidence and accounting fields. Unsupported/malformed/extra
+stdout is unknown. Quiescence is required for settled outcomes; success also
+requires matching root completion and a hashed artifact manifest. Manifest
+`sha256` hashes the canonical `entries` array. Large manifests may instead
+use `entries=null`, `locator`, `sha256` and positive `size_bytes`; their immutable
+content must be verified by the artifact-transfer acceptance path. Each stop process entry uses
+`pid` and `process_start_identity`; generations and scope must match mapping.
+Known usage uses canonical request buckets, `lineage_coverage="complete"` and a
+nonempty epoch. Cost provenance uses `kind="actual"|"estimated"|"unknown"` plus
+currency/source/pricing_version. Partial/unknown accounting stays in
+`resultJson.execution` and is omitted from top-level `usage`/`costUsd`.
+Only known USD cost maps to `costUsd`. Terminal outcome/completion/stop facts
+cannot change in later revisions. `resultJson.stop_confirmed` is derived from
+validated evidence. No automatic recovery/retry hint is returned.
+
+Shared helper changes are opt-in: `execution-target.ts` forwards `signal`,
+`keepStdinOpen`, and `isolateSsh`; `server-utils.ts` checks cancellation before
+and after async SSH preparation, terminates the SSH child on abort, and can hold
+stdin open; `ssh.ts` implements isolated SSH argv. These are needed because the
+previous helper ignores abort and closes/ignores stdin, which would falsely
+signal channel loss to the bridge. Defaults for other callers are unchanged.
+
+Offline verification, from the Paperclip repository with Node >=24.11:
+
+```sh
+pnpm --filter @paperclipai/hermes-paperclip-adapter test
+pnpm --filter @paperclipai/hermes-paperclip-adapter typecheck
+```
+
+The new transport tests mock SSH; local process tests verify stdin and abort
+with real shell subprocesses. Existing HTTP helper tests need permission to
+listen on loopback. Real SSH, bridge/supervisor isolation and complete
+Paperclip restart/UI/retry suppression remain M3 acceptance requirements; a
+static environment check reports a warning until that acceptance is performed.
+
 ## Key Features
 
 This adapter provides:

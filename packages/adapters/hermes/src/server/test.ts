@@ -18,6 +18,7 @@ import { promisify } from "node:util";
 import { HERMES_CLI, DEFAULT_MODEL, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
 import { resolveHermesCommand } from "./execute.js";
+import { bridgeTarget } from "./bridge-execute.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -329,6 +330,20 @@ export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
   const config = (ctx.config ?? {}) as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(config, "bridgeProfile")) {
+    let valid = true;
+    try {
+      bridgeTarget(ctx);
+      if (typeof config.hermesCommand !== "string" || !config.hermesCommand.startsWith("/")) valid = false;
+      if (!config.bridgeProfile || typeof config.bridgeProfile !== "object") valid = false;
+    } catch { valid = false; }
+    return {
+      adapterType: ADAPTER_TYPE, status: valid ? "warn" : "fail", testedAt: new Date().toISOString(),
+      checks: [{ level: valid ? "warn" : "error", code: "bridge_profile_preflight",
+        message: valid ? "Bridge target configuration accepted; real SSH/supervisor acceptance is still required." : "Bridge requires an explicit profile, an absolute hermesCommand, and a strictly pinned SSH target.",
+      }],
+    };
+  }
   const command = resolveHermesCommand(config);
   const checks: AdapterEnvironmentCheck[] = [];
 
